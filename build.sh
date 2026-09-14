@@ -57,6 +57,31 @@ echo "CCACHE_DIR: [$CCACHE_DIR]"
 
 MAKE_ARGS="ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
+# GitHub Actions can ask the build to preserve proof of the configuration
+# embedded in the freshly linked Image.  This must happen before the optional
+# KernelPatch/KPM step: that tool rewrites Image and can hide the new IKCONFIG
+# while leaving an unrelated, stale IKCONFIG member visible to extractors.
+snapshot_ci_kernel() {
+    local variant=$1 image config
+    [ -n "${CI_FINAL_CONFIG_DIR:-}" ] || return 0
+
+    image="out/arch/arm64/boot/Image"
+    config="${CI_FINAL_CONFIG_DIR}/${TARGET_DEVICE}-${variant}-final.config"
+    mkdir -p "${CI_FINAL_CONFIG_DIR}"
+    bash docker-ci.sh snapshot "${image}" out/.config "${config}"
+    sha256sum "${image}" | cut -d ' ' -f 1 \
+        > "${CI_FINAL_CONFIG_DIR}/${TARGET_DEVICE}-${variant}-unpatched-image.sha256"
+    echo "Saved and verified pre-KPM ${variant} IKCONFIG: ${config}"
+}
+
+record_ci_packaged_image() {
+    local variant=$1
+    [ -n "${CI_FINAL_CONFIG_DIR:-}" ] || return 0
+
+    sha256sum out/arch/arm64/boot/Image | cut -d ' ' -f 1 \
+        > "${CI_FINAL_CONFIG_DIR}/${TARGET_DEVICE}-${variant}-packaged-image.sha256"
+}
+
 
 if [ "$1" == "j1" ]; then
     make $MAKE_ARGS -j1
@@ -154,6 +179,8 @@ else
     exit 1
 fi
 
+snapshot_ci_kernel aosp
+
 echo "Generating [out/arch/arm64/boot/dtb]......"
 find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + >out/arch/arm64/boot/dtb
 
@@ -171,6 +198,8 @@ if [ $KSU_ENABLE -eq 1 ]; then
     mv oImage Image
     cd -
 fi
+
+record_ci_packaged_image aosp
 
 cp out/arch/arm64/boot/Image anykernel/kernels/
 cp out/arch/arm64/boot/dtb anykernel/kernels/
@@ -324,6 +353,8 @@ else
     exit 1
 fi
 
+snapshot_ci_kernel miui
+
 echo "Generating [out/arch/arm64/boot/dtb]......"
 find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + >out/arch/arm64/boot/dtb
 
@@ -345,6 +376,8 @@ if [ $KSU_ENABLE -eq 1 ]; then
     mv oImage Image
     cd -
 fi
+
+record_ci_packaged_image miui
 
 cp out/arch/arm64/boot/Image anykernel/kernels/
 cp out/arch/arm64/boot/dtb anykernel/kernels/

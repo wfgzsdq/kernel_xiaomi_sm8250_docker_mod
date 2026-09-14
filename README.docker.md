@@ -13,8 +13,9 @@
 
 - `docker.config`：补齐 namespaces、IPC、cgroups、seccomp、keys、OverlayFS、veth/bridge、IPv4/IPv6 iptables NAT，以及 IPVS 等选项。全部要求 `=y`，因为现有 AnyKernel3 打包流程不会另行安装这些内核模块。
 - `docker-ci.sh prepare`：加载上游 `alioth_defconfig`，用 `merge_config.sh` 合并片段，执行 `olddefconfig`，逐项检查片段中的所有选项，再以 `savedefconfig` 生成临时 defconfig；从临时 defconfig 重新生成完整配置并再次检查。
-- Actions 只临时覆盖 runner 工作区的 `arch/arm64/configs/alioth_defconfig`，让原版 `build.sh` 两次加载的配置都包含 Docker 选项。Git 提交不修改此文件，也不修改 `build.sh`。
-- `docker-ci.sh collect`：分别解压两套 ZIP 中的 `kernels/Image`，用源码自带的 `scripts/extract-ikconfig` 提取实际嵌入的最终配置，再次逐项严格验证。这样 AOSP 的配置不会因 MIUI 阶段删除 `out/` 而丢失。
+- Actions 只临时覆盖 runner 工作区的 `arch/arm64/configs/alioth_defconfig`，让 `build.sh` 两次加载的配置都包含 Docker 选项。Git 提交不修改此 defconfig；`build.sh` 中仅增加由 CI 环境变量启用的配置快照和镜像校验值记录，普通本地构建路径不受影响。
+- `build.sh` 在可选的 KPM 补丁改写 Image **之前**，从刚链接的内核中提取 IKCONFIG，并与当时的 `out/.config` 逐字节比较；这样 AOSP 的配置不会因 MIUI 阶段删除 `out/` 而丢失，也不会误把 KPM 改写后镜像中残留的旧 IKCONFIG 当成本次配置。
+- `docker-ci.sh collect`：分别解压两套 ZIP 中的 `kernels/Image`，核对它与打包时记录的 SHA-256 完全一致，再逐项严格验证补丁前已确认的最终配置。关闭 KPM 时还会从 ZIP 内 Image 再提取一次配置并交叉比较。
 - 同时检查 MIUI 包含 `CONFIG_XIAOMI_MIUI=y`、AOSP 不包含该选项，并确认 MIUI 嵌入配置与最后的 `out/.config` 完全一致。
 - 少任意配置、少任意一种 ZIP、ZIP 损坏、配置提取失败或编译失败，任务都会失败；只有两套内核均通过检查才上传正式产物。失败日志和已获得的配置仍作为 diagnostics 上传。
 
@@ -37,7 +38,8 @@
 成功运行的 `alioth-docker-both-roms-*` artifact 包含：
 
 - 两套 `Kernel_AOSP_alioth_*.zip` 和 `Kernel_MIUI_alioth_*.zip`。
-- `alioth-aosp-final.config`、`alioth-miui-final.config`：来自各自包内 Image 的最终配置。
+- `alioth-aosp-final.config`、`alioth-miui-final.config`：来自各自 KPM 改写前的已编译 Image，并已与对应 `out/.config` 逐字节比较。
+- `alioth-*-unpatched-image.sha256`、`alioth-*-packaged-image.sha256`：KPM 改写前及 ZIP 内最终 Image 的关联校验值。
 - `alioth-docker-resolved.config` 和 `alioth-docker.defconfig`：编译前验证的完整配置与临时 defconfig。
 - `docker.config`、提交记录、环境记录和 `SHA256SUMS`。
 

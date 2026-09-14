@@ -28,39 +28,31 @@ verify_config() {
     echo "Verified $count built-in Docker options in $config"
 }
 
-extract_matching_config() {
-    local image=${1:?Expected a kernel Image}
-    local output=${2:?Expected an output config}
-    local variant=${3:?Expected AOSP or MIUI}
-    local expected_commit candidates_dir candidate localversion
-    local -a candidates matches=()
+snapshot_config() {
+    local image=${1:?Expected a linked kernel Image}
+    local build_config=${2:?Expected the build .config}
+    local output=${3:?Expected a snapshot path}
 
-    expected_commit=$(cut -c1-8 ci-artifacts/source-commit.txt)
-    if [[ ! "$expected_commit" =~ ^[0-9a-f]{8}$ ]]; then
-        echo "Invalid source commit recorded by the prepare step: $expected_commit" >&2
-        return 1
-    fi
+    test -s "$image"
+    test -s "$build_config"
+    mkdir -p "$(dirname -- "$output")"
 
-    candidates_dir="ci-diagnostics/${variant,,}-ikconfig-candidates"
-    mkdir -p "$candidates_dir"
-    rm -f -- "$candidates_dir"/candidate-*.config
-
-    # A patched Image can contain more than one IKCONFIG gzip member.  The
-    # upstream extract-ikconfig script stops at the first marker, which may be
-    # a stale config embedded in an older binary blob.  Decode every member so
-    # the config of the kernel built by this commit can be selected below.
-    python - "$image" "$candidates_dir" <<'PY'
+    # Vendor blobs can contain an older IKCONFIG before the kernel's own
+    # member.  Decode every valid member and require exactly one byte-for-byte
+    # match with the .config that produced this still-unpatched Image.
+    python - "$image" "$build_config" "$output" <<'PY'
 from hashlib import sha256
 from pathlib import Path
 import sys
 import zlib
 
 image = Path(sys.argv[1]).read_bytes()
-output_dir = Path(sys.argv[2])
+expected = Path(sys.argv[2]).read_bytes()
+output = Path(sys.argv[3])
 marker = b"IKCFG_ST"
 offset = 0
-seen = set()
-written = 0
+decoded = 0
+matches = []
 
 while True:
     offset = image.find(marker, offset)
@@ -75,48 +67,26 @@ while True:
         config = decoder.decompress(image[gzip_offset:]) + decoder.flush()
     except zlib.error:
         continue
-    if (b"Kernel Configuration" not in config or b"CONFIG_" not in config
-            or b"\x00" in config):
+    if not decoder.eof or b"Kernel Configuration" not in config or b"CONFIG_" not in config:
         continue
+    decoded += 1
     digest = sha256(config).hexdigest()
-    if digest in seen:
-        continue
-    seen.add(digest)
-    written += 1
-    path = output_dir / f"candidate-{written:02d}-offset-{gzip_offset}.config"
-    path.write_bytes(config)
-    print(f"Decoded IKCONFIG candidate {written} at byte {gzip_offset}: {digest}")
+    print(f"Decoded pre-KPM IKCONFIG at byte {gzip_offset}: {digest}")
+    if config == expected:
+        matches.append(gzip_offset)
 
-if written == 0:
-    raise SystemExit("No valid IKCONFIG gzip members found in packaged Image")
+if len(matches) != 1:
+    raise SystemExit(
+        f"Expected exactly one pre-KPM IKCONFIG matching out/.config; "
+        f"decoded {decoded}, matched {len(matches)}"
+    )
+
+output.write_bytes(expected)
+print(f"Selected IKCONFIG at byte {matches[0]}")
 PY
 
-    candidates=("$candidates_dir"/candidate-*.config)
-    for candidate in "${candidates[@]}"; do
-        localversion=$(grep -m1 '^CONFIG_LOCALVERSION=' "$candidate" || true)
-        [[ "$localversion" == *"$expected_commit"* ]] || continue
-        verify_config "$candidate" >/dev/null 2>&1 || continue
-        if [[ "$variant" == MIUI ]]; then
-            grep -qx 'CONFIG_XIAOMI_MIUI=y' "$candidate" || continue
-        elif grep -qx 'CONFIG_XIAOMI_MIUI=y' "$candidate"; then
-            continue
-        fi
-        matches+=("$candidate")
-    done
-
-    if [[ ${#matches[@]} -ne 1 ]]; then
-        echo "Expected exactly one $variant IKCONFIG for commit $expected_commit with all Docker options; found ${#matches[@]}" >&2
-        for candidate in "${candidates[@]}"; do
-            echo "--- $candidate" >&2
-            grep -m1 '^# Linux/.\+ Kernel Configuration$' "$candidate" >&2 || true
-            grep -m1 '^CONFIG_LOCALVERSION=' "$candidate" >&2 || true
-            verify_config "$candidate" >&2 || true
-        done
-        return 1
-    fi
-
-    cp "${matches[0]}" "$output"
-    echo "Selected $variant IKCONFIG from ${matches[0]}"
+    cmp "$build_config" "$output"
+    verify_config "$output"
 }
 
 prepare_config() {
@@ -155,9 +125,13 @@ prepare_config() {
 }
 
 collect_artifacts() {
-    local variant lower archive image_file config
+    local variant lower archive image_file config snapshot_dir snapshot_config
+    local expected_commit actual_hash expected_hash unpatched_hash
     local -a archives
     mkdir -p ci-artifacts ci-diagnostics ci-config
+    snapshot_dir=${CI_FINAL_CONFIG_DIR:-ci-config/final}
+    expected_commit=$(cut -c1-8 ci-artifacts/source-commit.txt)
+    [[ "$expected_commit" =~ ^[0-9a-f]{8}$ ]]
     shopt -s nullglob
     for variant in AOSP MIUI; do
         lower=${variant,,}
@@ -170,14 +144,42 @@ collect_artifacts() {
         unzip -tq "$archive"
         image_file="ci-config/${lower}.Image"
         config="ci-diagnostics/alioth-${lower}-final.config"
-        # AOSP's out/.config has already been deleted by build.sh at this point.
-        # IKCONFIG in kernels/Image is the config of the actual packaged kernel,
-        # including upstream KSU/MIUI edits and the compiler's Kconfig resolution.
+        snapshot_config="$snapshot_dir/alioth-${lower}-final.config"
+        test -s "$snapshot_config"
+
+        # The snapshot was extracted from the linked Image and compared byte for
+        # byte with out/.config before KernelPatch/KPM rewrote the image.  Verify
+        # that the ZIP contains the exact post-patch image recorded by build.sh.
         unzip -p "$archive" kernels/Image > "$image_file"
         test -s "$image_file"
-        extract_matching_config "$image_file" "$config" "$variant"
-        rm -f -- "$image_file"
+        actual_hash=$(sha256sum "$image_file" | cut -d ' ' -f 1)
+        expected_hash=$(<"$snapshot_dir/alioth-${lower}-packaged-image.sha256")
+        unpatched_hash=$(<"$snapshot_dir/alioth-${lower}-unpatched-image.sha256")
+        if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ || ! "$unpatched_hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid recorded $variant Image checksum" >&2
+            return 1
+        fi
+        if [[ "$actual_hash" != "$expected_hash" ]]; then
+            echo "$variant ZIP does not contain the Image recorded at packaging time" >&2
+            return 1
+        fi
+        if [[ ${ENABLE_KSU:-false} == true ]]; then
+            if [[ "$actual_hash" == "$unpatched_hash" ]]; then
+                echo "$variant Image was not changed by the requested KPM patch" >&2
+                return 1
+            fi
+        else
+            if [[ "$actual_hash" != "$unpatched_hash" ]]; then
+                echo "$variant Image changed even though KPM was disabled" >&2
+                return 1
+            fi
+            bash scripts/extract-ikconfig "$image_file" > "ci-config/${lower}-packaged.config"
+            cmp "$snapshot_config" "ci-config/${lower}-packaged.config"
+        fi
+        echo "Verified packaged $variant Image SHA-256: $actual_hash"
+        cp "$snapshot_config" "$config"
         verify_config "$config"
+        grep -q "^CONFIG_LOCALVERSION=.*${expected_commit}" "$config"
         if [[ "$variant" == MIUI ]]; then
             grep -qx 'CONFIG_XIAOMI_MIUI=y' "$config"
             cmp out/.config "$config"
@@ -185,7 +187,9 @@ collect_artifacts() {
             echo 'AOSP archive unexpectedly contains a MIUI kernel' >&2
             return 1
         fi
+        rm -f -- "$image_file"
         cp "$config" "$archive" ci-artifacts/
+        cp "$snapshot_dir"/alioth-"$lower"-*-image.sha256 ci-artifacts/
     done
     cp docker.config ci-artifacts/
     if [[ -d anykernel/.git ]]; then
@@ -195,12 +199,13 @@ collect_artifacts() {
         git -C KernelSU rev-parse HEAD > ci-artifacts/kernelsu-commit.txt
     fi
     ccache -s > ci-artifacts/ccache-stats.txt
-    (cd ci-artifacts && sha256sum -- *.zip *.config *.defconfig *.txt > SHA256SUMS)
+    (cd ci-artifacts && sha256sum -- *.zip *.config *.defconfig *.sha256 *.txt > SHA256SUMS)
 }
 
 case "${1:-}" in
     prepare) prepare_config ;;
     verify) verify_config "${2:?Usage: bash docker-ci.sh verify CONFIG}" ;;
+    snapshot) snapshot_config "${2:?}" "${3:?}" "${4:?}" ;;
     collect) collect_artifacts ;;
-    *) echo 'Usage: bash docker-ci.sh {prepare|verify CONFIG|collect}' >&2; exit 2 ;;
+    *) echo 'Usage: bash docker-ci.sh {prepare|verify CONFIG|snapshot IMAGE CONFIG OUTPUT|collect}' >&2; exit 2 ;;
 esac

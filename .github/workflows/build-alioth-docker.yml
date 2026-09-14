@@ -94,13 +94,14 @@ jobs:
 
       - name: Build both AOSP and MIUI-HyperOS with upstream build.sh
         run: |
+          export CI_FINAL_CONFIG_DIR="$GITHUB_WORKSPACE/ci-config/final"
           if [[ "$ENABLE_KSU" == true ]]; then
             bash -o pipefail build.sh alioth ksu 2>&1 | tee ci-diagnostics/build.log
           else
             bash -o pipefail build.sh alioth 2>&1 | tee ci-diagnostics/build.log
           fi
 
-      - name: Extract and verify the final config from each packaged kernel
+      - name: Verify packaged images and pre-KPM final configs
         run: bash docker-ci.sh collect 2>&1 | tee ci-diagnostics/verify-artifacts.log
 
       - name: Upload AOSP, MIUI-HyperOS, final configs and checksums
