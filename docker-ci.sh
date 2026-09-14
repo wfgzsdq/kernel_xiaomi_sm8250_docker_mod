@@ -28,6 +28,97 @@ verify_config() {
     echo "Verified $count built-in Docker options in $config"
 }
 
+extract_matching_config() {
+    local image=${1:?Expected a kernel Image}
+    local output=${2:?Expected an output config}
+    local variant=${3:?Expected AOSP or MIUI}
+    local expected_commit candidates_dir candidate localversion
+    local -a candidates matches=()
+
+    expected_commit=$(cut -c1-8 ci-artifacts/source-commit.txt)
+    if [[ ! "$expected_commit" =~ ^[0-9a-f]{8}$ ]]; then
+        echo "Invalid source commit recorded by the prepare step: $expected_commit" >&2
+        return 1
+    fi
+
+    candidates_dir="ci-diagnostics/${variant,,}-ikconfig-candidates"
+    mkdir -p "$candidates_dir"
+    rm -f -- "$candidates_dir"/candidate-*.config
+
+    # A patched Image can contain more than one IKCONFIG gzip member.  The
+    # upstream extract-ikconfig script stops at the first marker, which may be
+    # a stale config embedded in an older binary blob.  Decode every member so
+    # the config of the kernel built by this commit can be selected below.
+    python - "$image" "$candidates_dir" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+import zlib
+
+image = Path(sys.argv[1]).read_bytes()
+output_dir = Path(sys.argv[2])
+marker = b"IKCFG_ST"
+offset = 0
+seen = set()
+written = 0
+
+while True:
+    offset = image.find(marker, offset)
+    if offset < 0:
+        break
+    gzip_offset = offset + len(marker)
+    offset += 1
+    if image[gzip_offset:gzip_offset + 3] != b"\x1f\x8b\x08":
+        continue
+    try:
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        config = decoder.decompress(image[gzip_offset:]) + decoder.flush()
+    except zlib.error:
+        continue
+    if (b"Kernel Configuration" not in config or b"CONFIG_" not in config
+            or b"\x00" in config):
+        continue
+    digest = sha256(config).hexdigest()
+    if digest in seen:
+        continue
+    seen.add(digest)
+    written += 1
+    path = output_dir / f"candidate-{written:02d}-offset-{gzip_offset}.config"
+    path.write_bytes(config)
+    print(f"Decoded IKCONFIG candidate {written} at byte {gzip_offset}: {digest}")
+
+if written == 0:
+    raise SystemExit("No valid IKCONFIG gzip members found in packaged Image")
+PY
+
+    candidates=("$candidates_dir"/candidate-*.config)
+    for candidate in "${candidates[@]}"; do
+        localversion=$(grep -m1 '^CONFIG_LOCALVERSION=' "$candidate" || true)
+        [[ "$localversion" == *"$expected_commit"* ]] || continue
+        verify_config "$candidate" >/dev/null 2>&1 || continue
+        if [[ "$variant" == MIUI ]]; then
+            grep -qx 'CONFIG_XIAOMI_MIUI=y' "$candidate" || continue
+        elif grep -qx 'CONFIG_XIAOMI_MIUI=y' "$candidate"; then
+            continue
+        fi
+        matches+=("$candidate")
+    done
+
+    if [[ ${#matches[@]} -ne 1 ]]; then
+        echo "Expected exactly one $variant IKCONFIG for commit $expected_commit with all Docker options; found ${#matches[@]}" >&2
+        for candidate in "${candidates[@]}"; do
+            echo "--- $candidate" >&2
+            grep -m1 '^# Linux/.\+ Kernel Configuration$' "$candidate" >&2 || true
+            grep -m1 '^CONFIG_LOCALVERSION=' "$candidate" >&2 || true
+            verify_config "$candidate" >&2 || true
+        done
+        return 1
+    fi
+
+    cp "${matches[0]}" "$output"
+    echo "Selected $variant IKCONFIG from ${matches[0]}"
+}
+
 prepare_config() {
     local toolchain="$HOME/proton-clang/proton-clang-20210522/bin"
     export PATH="$toolchain:$PATH"
@@ -84,7 +175,7 @@ collect_artifacts() {
         # including upstream KSU/MIUI edits and the compiler's Kconfig resolution.
         unzip -p "$archive" kernels/Image > "$image_file"
         test -s "$image_file"
-        bash scripts/extract-ikconfig "$image_file" > "$config"
+        extract_matching_config "$image_file" "$config" "$variant"
         rm -f -- "$image_file"
         verify_config "$config"
         if [[ "$variant" == MIUI ]]; then
