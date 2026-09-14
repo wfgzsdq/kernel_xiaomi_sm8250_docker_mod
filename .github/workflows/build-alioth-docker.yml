@@ -1,0 +1,126 @@
+name: Build alioth Docker kernel
+
+on:
+  push:
+    branches: [docker-alioth]
+  workflow_dispatch:
+    inputs:
+      ksu:
+        description: Include upstream SukiSU/SUSFS and KPM in both variants
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alioth-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: AOSP and MIUI-HyperOS / alioth
+    if: github.ref == 'refs/heads/docker-alioth'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    env:
+      CCACHE_DIR: /home/runner/.cache/ccache_mikernel
+      # A push has no workflow_dispatch input. Keep the discussed KSU default.
+      ENABLE_KSU: ${{ github.event_name == 'push' || inputs.ksu }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl wget bison flex zip unzip \
+            bc cpio libssl-dev libelf-dev libtinfo5 ccache python-is-python3
+          bash -n build.sh docker-ci.sh
+          mkdir -p ci-artifacts ci-diagnostics
+          df -h .
+
+      - name: Cache Proton Clang
+        id: proton
+        uses: actions/cache@v4
+        with:
+          path: ~/proton-clang/proton-clang-20210522
+          key: proton-clang-${{ runner.os }}-${{ runner.arch }}-20210522-v1
+
+      - name: Install Proton Clang at the upstream build.sh path
+        if: steps.proton.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/proton-clang"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
+            -o "$RUNNER_TEMP/proton-clang.zip"
+          unzip -q "$RUNNER_TEMP/proton-clang.zip" -d "$HOME/proton-clang"
+          sha256sum "$RUNNER_TEMP/proton-clang.zip" \
+            > "$HOME/proton-clang/proton-clang-20210522/archive-sha256.txt"
+
+      - name: Check toolchain
+        run: |
+          toolchain="$HOME/proton-clang/proton-clang-20210522"
+          "$toolchain/bin/clang" --version
+          "$toolchain/bin/aarch64-linux-gnu-ld" --version
+          "$toolchain/bin/arm-linux-gnueabi-ld" --version
+          cp "$toolchain/archive-sha256.txt" ci-artifacts/toolchain-archive-sha256.txt
+
+      - name: Cache compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache_mikernel
+          key: ccache-alioth-proton20210522-${{ runner.os }}-${{ github.sha }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-alioth-proton20210522-${{ runner.os }}-${{ github.sha }}-
+            ccache-alioth-proton20210522-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 2G
+          ccache -z
+
+      - name: Merge Docker fragment, resolve Kconfig and verify regenerated defconfig
+        run: bash docker-ci.sh prepare 2>&1 | tee ci-diagnostics/configure.log
+
+      - name: Build both AOSP and MIUI-HyperOS with upstream build.sh
+        run: |
+          if [[ "$ENABLE_KSU" == true ]]; then
+            bash -o pipefail build.sh alioth ksu 2>&1 | tee ci-diagnostics/build.log
+          else
+            bash -o pipefail build.sh alioth 2>&1 | tee ci-diagnostics/build.log
+          fi
+
+      - name: Extract and verify the final config from each packaged kernel
+        run: bash docker-ci.sh collect 2>&1 | tee ci-diagnostics/verify-artifacts.log
+
+      - name: Upload AOSP, MIUI-HyperOS, final configs and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-docker-both-roms-${{ github.run_number }}-${{ github.sha }}
+          path: ci-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-docker-diagnostics-${{ github.run_number }}-${{ github.sha }}
+          path: ci-diagnostics/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Restore the upstream defconfig in the working copy
+        if: always()
+        run: git restore --source=HEAD -- arch/arm64/configs/alioth_defconfig
